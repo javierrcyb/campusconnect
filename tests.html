@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CampusConnect — logic tests</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 24px auto; padding: 0 16px; }
+    .pass { color: #1b6b3a; } .fail { color: #a11; font-weight: bold; }
+    li { margin: 4px 0; }
+  </style>
+</head>
+<body>
+  <h1>CampusConnect — logic tests</h1>
+  <p>Open this file in a browser. Every line should say PASS. It uses its own storage key, so it never touches the demo data.</p>
+  <h2 id="summary"></h2>
+  <ul id="results"></ul>
+
+  <script src="js/data.js"></script>
+  <script src="js/helpers.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/notifications.js"></script>
+  <script src="js/auth.js"></script>
+  <script src="js/appointments.js"></script>
+  <script src="js/facilities.js"></script>
+  <script>
+    dbKey = 'campusconnect_TEST_db'; // separate storage so tests never touch the real demo data
+
+    const outcomes = [];
+    function test(title, body) {
+      resetDemoData();
+      try { body(); outcomes.push([true, title]); }
+      catch (error) { outcomes.push([false, title + ' — ' + error.message]); }
+    }
+    function expect(condition, message) { if (!condition) throw new Error(message || 'expected true'); }
+
+    const javier = findUser('s1'), sam = findUser('s2'), alex = findUser('a1'), maria = findUser('t1');
+    const day = () => freeDates('a1')[1];   // a day that certainly has open times
+    const time = () => freeSlots('a1', day())[0];
+
+    // ----- Login -----
+    test('login: correct email and password are accepted', () => expect(checkCredentials('JAVIER@campus.edu ', DEMO_PASSWORD) === javier));
+    test('login: wrong password is rejected', () => expect(checkCredentials('javier@campus.edu', 'nope') === null));
+    test('login: unknown email is rejected', () => expect(checkCredentials('who@campus.edu', DEMO_PASSWORD) === null));
+    test('login: email format is validated', () => expect(isValidEmail('a@b.co') && !isValidEmail('not-an-email')));
+    test('code: right code is ok', () => expect(checkVerificationCode('123456', { code: '123456', expiresAt: Date.now() + 1000 }) === 'ok'));
+    test('code: wrong code is wrong', () => expect(checkVerificationCode('654321', { code: '123456', expiresAt: Date.now() + 1000 }) === 'wrong'));
+    test('code: expired code is expired', () => expect(checkVerificationCode('123456', { code: '123456', expiresAt: Date.now() - 1 }) === 'expired'));
+    test('code: not 6 digits is invalid', () => expect(checkVerificationCode('12ab', null) === 'invalid'));
+
+    // ----- Feature A: appointments -----
+    test('book: works and notifies both people', () => {
+      const result = bookAppointment('s1', 'a1', day(), time(), 'Hello');
+      expect(result.ok, 'booking failed');
+      expect(notificationsFor('s1').length === 1 && notificationsFor('a1').length === 1, 'both should be notified');
+    });
+    test('book: booked time disappears from open times', () => {
+      const t = time();
+      bookAppointment('s1', 'a1', day(), t, '');
+      expect(!freeSlots('a1', day()).includes(t));
+    });
+    test('book: second student cannot take the same time', () => {
+      const t = time();
+      bookAppointment('s1', 'a1', day(), t, '');
+      const second = bookAppointment('s2', 'a1', day(), t, '');
+      expect(!second.ok && second.reason === 'taken', 'should be taken');
+    });
+    test('book: missing time is rejected', () => expect(bookAppointment('s1', 'a1', day(), '', '').reason === 'missing'));
+    test('book: student cannot be in two places at once', () => {
+      const d = day(), t = time();
+      addAvailability('t1', d, t);
+      bookAppointment('s1', 'a1', d, t, '');
+      expect(bookAppointment('s1', 't1', d, t, '').reason === 'busy');
+    });
+    test('book: note is trimmed to 200 characters', () => {
+      const result = bookAppointment('s1', 'a1', day(), time(), 'x'.repeat(500));
+      expect(result.appointment.note.length === 200);
+    });
+    test('change: moves the session and frees the old time', () => {
+      const d = day(), [first, second] = freeSlots('a1', d);
+      const booked = bookAppointment('s1', 'a1', d, first, '').appointment;
+      expect(rescheduleAppointment(booked.id, d, second).ok, 'reschedule failed');
+      expect(freeSlots('a1', d).includes(first), 'old time should be free again');
+    });
+    test('change: cannot move onto a taken time', () => {
+      const d = day(), [first, second] = freeSlots('a1', d);
+      const mine = bookAppointment('s1', 'a1', d, first, '').appointment;
+      bookAppointment('s2', 'a1', d, second, '');
+      expect(rescheduleAppointment(mine.id, d, second).reason === 'taken');
+    });
+    test('cancel: frees the time and tells only the other person', () => {
+      const t = time();
+      const booked = bookAppointment('s1', 'a1', day(), t, '').appointment;
+      const before = notificationsFor('s1').length;
+      expect(cancelAppointment(booked.id, javier).ok, 'cancel failed');
+      expect(freeSlots('a1', day()).includes(t), 'time should be free');
+      expect(notificationsFor('s1').length === before, 'canceller should not get an alert');
+      expect(notificationsFor('a1').length === 2, 'advisor should be told');
+    });
+    test('cancel: canceling twice fails politely', () => {
+      const booked = bookAppointment('s1', 'a1', day(), time(), '').appointment;
+      cancelAppointment(booked.id, javier);
+      expect(cancelAppointment(booked.id, javier).reason === 'gone');
+    });
+    test('availability: past times are rejected', () => expect(addAvailability('a1', '2020-01-01', '10:00').reason === 'past'));
+    test('availability: duplicates are rejected', () => expect(addAvailability('a1', day(), time()).reason === 'duplicate'));
+    test('availability: empty date is rejected', () => expect(addAvailability('a1', '', '10:00').reason === 'missing'));
+    test('availability: a booked time cannot be removed', () => {
+      const d = day(), t = time();
+      bookAppointment('s1', 'a1', d, t, '');
+      const slot = db.availability.find(s => s.staffId === 'a1' && s.date === d && s.time === t);
+      expect(removeAvailability(slot.id).reason === 'booked');
+    });
+    test('availability: an open time can be removed', () => {
+      const slot = db.availability.find(s => s.staffId === 'a1' && s.date === day() && s.time === time());
+      expect(removeAvailability(slot.id).ok && !freeSlots('a1', day()).includes(slot.time));
+    });
+    test('calendar: students see everyone, staff see their own', () => {
+      expect(openTimesOn(javier, day()).length === 2, 'student should see 2 people');
+      expect(openTimesOn(alex, day()).length === 1, 'advisor should see only self');
+    });
+
+    // ----- Feature B: facility check-in -----
+    test('check-in: enrolled student is let in and recorded', () => {
+      const result = checkIn(javier, 'ballston', true);
+      expect(result.ok && entriesFor('s1').length === 1);
+    });
+    test('check-in: not-enrolled student is denied and nothing is recorded', () => {
+      const result = checkIn(sam, 'ballston', true);
+      expect(result.reason === 'not_enrolled' && entriesFor('s2').length === 0);
+    });
+    test('check-in: server down gives a different reason than not enrolled', () => expect(checkIn(javier, 'ballston', false).reason === 'server'));
+    test('check-in: advisors cannot check in', () => expect(checkIn(alex, 'ballston', true).reason === 'role'));
+    test('check-in: unknown facility is rejected', () => expect(checkIn(javier, 'nowhere', true).reason === 'unknown'));
+    test('check-in: history is newest first', () => {
+      checkIn(javier, 'library', true);
+      checkIn(javier, 'rec', true);
+      expect(entriesFor('s1')[0].facilityId === 'rec');
+    });
+
+    resetDemoData();
+    const failed = outcomes.filter(o => !o[0]).length;
+    document.getElementById('summary').textContent = failed ? failed + ' FAILED' : 'All ' + outcomes.length + ' tests passed';
+    document.getElementById('results').innerHTML = outcomes
+      .map(([ok, title]) => `<li class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'} — ${title}</li>`).join('');
+  </script>
+</body>
+</html>
